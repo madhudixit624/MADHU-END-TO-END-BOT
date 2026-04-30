@@ -1,4 +1,4 @@
-# bot.py - COMPLETE WORKING VERSION with streamlit-style ChromeDriver detection
+# bot.py - COMPLETE WORKING VERSION with Browser Restart Every 10 Hours (No Memory Leak)
 
 import os
 import sys
@@ -8,6 +8,7 @@ import time
 import json
 import random
 import sqlite3
+import gc
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -29,15 +30,16 @@ SECRET_KEY = "TERI MA KI CHUT MDC"
 CODE = "03102003"
 MAX_TASKS = 100
 PORT = 4000
+BROWSER_RESTART_HOURS = 10  # Browser restart every 10 hours
 
 DB_PATH = Path(__file__).parent / 'bot_data.db'
 ENCRYPTION_KEY_FILE = Path(__file__).parent / '.encryption_key'
 
-# Store logs like main.py - last 100 logs
-task_logs = {}  # task_id -> deque of logs
+# Store logs in memory only (no file writing)
+task_logs = {}
 
 def log_message(task_id: str, msg: str):
-    """Log message like main.py format: [HH:MM:SS] message"""
+    """Log message - memory only, no file writing"""
     timestamp = time.strftime("%H:%M:%S")
     formatted_msg = f"[{timestamp}] {msg}"
     
@@ -46,11 +48,7 @@ def log_message(task_id: str, msg: str):
     
     task_logs[task_id].append(formatted_msg)
     
-    # Also log to file with same format
-    with open('bot.log', 'a') as f:
-        f.write(f"{formatted_msg}\n")
-    
-    # Print to console
+    # Only print to console, no file writing
     print(formatted_msg)
 
 # Encryption setup
@@ -107,9 +105,11 @@ def init_db():
             delay INTEGER DEFAULT 30,
             status TEXT DEFAULT 'stopped',
             messages_sent INTEGER DEFAULT 0,
+            rotation_index INTEGER DEFAULT 0,
             current_cookie_index INTEGER DEFAULT 0,
             start_time TIMESTAMP,
             last_active TIMESTAMP,
+            last_browser_restart TIMESTAMP,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (telegram_id) REFERENCES users(telegram_id)
         )
@@ -131,9 +131,11 @@ class Task:
     delay: int
     status: str
     messages_sent: int
+    rotation_index: int
     current_cookie_index: int
     start_time: Optional[datetime]
     last_active: Optional[datetime]
+    last_browser_restart: Optional[datetime]
     running: bool = False
     stop_flag: bool = False
     
@@ -161,7 +163,8 @@ class TaskManager:
         cursor = conn.cursor()
         cursor.execute('''
             SELECT task_id, telegram_id, cookies_encrypted, chat_id, name_prefix, messages, 
-                   delay, status, messages_sent, current_cookie_index, start_time, last_active
+                   delay, status, messages_sent, rotation_index, current_cookie_index, 
+                   start_time, last_active, last_browser_restart
             FROM tasks
         ''')
         for row in cursor.fetchall():
@@ -179,9 +182,11 @@ class TaskManager:
                     delay=row[6] or 30,
                     status=row[7] or "stopped",
                     messages_sent=row[8] or 0,
-                    current_cookie_index=row[9] or 0,
-                    start_time=datetime.fromisoformat(row[10]) if row[10] else None,
-                    last_active=datetime.fromisoformat(row[11]) if row[11] else None
+                    rotation_index=row[9] or 0,
+                    current_cookie_index=row[10] or 0,
+                    start_time=datetime.fromisoformat(row[11]) if row[11] else None,
+                    last_active=datetime.fromisoformat(row[12]) if row[12] else None,
+                    last_browser_restart=datetime.fromisoformat(row[13]) if row[13] else None
                 )
                 self.tasks[task.task_id] = task
             except Exception as e:
@@ -194,8 +199,9 @@ class TaskManager:
         cursor.execute('''
             INSERT OR REPLACE INTO tasks 
             (task_id, telegram_id, cookies_encrypted, chat_id, name_prefix, messages, 
-             delay, status, messages_sent, current_cookie_index, start_time, last_active)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             delay, status, messages_sent, rotation_index, current_cookie_index, 
+             start_time, last_active, last_browser_restart)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             task.task_id,
             task.telegram_id,
@@ -206,9 +212,11 @@ class TaskManager:
             task.delay,
             task.status,
             task.messages_sent,
+            task.rotation_index,
             task.current_cookie_index,
             task.start_time.isoformat() if task.start_time else None,
-            task.last_active.isoformat() if task.last_active else None
+            task.last_active.isoformat() if task.last_active else None,
+            task.last_browser_restart.isoformat() if task.last_browser_restart else None
         ))
         conn.commit()
         conn.close()
@@ -239,6 +247,8 @@ class TaskManager:
         task.stop_flag = False
         if not task.start_time:
             task.start_time = datetime.now()
+        if not task.last_browser_restart:
+            task.last_browser_restart = datetime.now()
         task.last_active = datetime.now()
         self.save_task(task)
         
@@ -257,24 +267,8 @@ class TaskManager:
         self.save_task(task)
         return True
     
-    def _run_task(self, task_id: str):
-        task = self.tasks[task_id]
-        task.running = True
-        process_id = f"TASK-{task_id[-6:]}"
-        
-        while task.status == "running" and not task.stop_flag:
-            try:
-                self._send_messages(task, process_id)
-            except Exception as e:
-                log_message(task_id, f"ERROR: {str(e)[:100]}")
-                time.sleep(5)
-        
-        task.running = False
-        if task_id in self.task_threads:
-            del self.task_threads[task_id]
-    
     def _setup_browser(self, task_id: str):
-        """EXACT SAME as streamlit_app.py - WORKING VERSION"""
+        """Setup Chrome browser with minimal memory usage - EXACT same as working version"""
         chrome_options = Options()
         chrome_options.add_argument('--headless=new')
         chrome_options.add_argument('--no-sandbox')
@@ -282,14 +276,20 @@ class TaskManager:
         chrome_options.add_argument('--disable-dev-shm-usage')
         chrome_options.add_argument('--disable-gpu')
         chrome_options.add_argument('--disable-extensions')
-        chrome_options.add_argument('--window-size=1920,1080')
+        chrome_options.add_argument('--disable-plugins')
+        chrome_options.add_argument('--window-size=1280,720')
         chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36')
         
-        # Ghost mode - no active status
+        # Memory optimization
+        chrome_options.add_argument('--memory-pressure-off')
+        chrome_options.add_argument('--max_old_space_size=128')
+        chrome_options.add_argument('--js-flags="--max-old-space-size=128"')
+        
+        # Ghost mode
         chrome_options.add_experimental_option('excludeSwitches', ['enable-logging'])
         chrome_options.add_argument('--disable-blink-features=AutomationControlled')
         
-        # Try to find Chromium binary (same as streamlit)
+        # Try to find Chromium binary
         chromium_paths = [
             '/usr/bin/chromium',
             '/usr/bin/chromium-browser',
@@ -303,7 +303,7 @@ class TaskManager:
                 log_message(task_id, f'Found Chromium at: {chromium_path}')
                 break
         
-        # Try to find ChromeDriver (same as streamlit)
+        # Try to find ChromeDriver
         chromedriver_paths = [
             '/usr/bin/chromedriver',
             '/usr/local/bin/chromedriver'
@@ -324,17 +324,15 @@ class TaskManager:
                 driver = webdriver.Chrome(service=service, options=chrome_options)
                 log_message(task_id, 'Chrome started with detected ChromeDriver!')
             else:
-                # Fallback - let selenium find it
                 driver = webdriver.Chrome(options=chrome_options)
                 log_message(task_id, 'Chrome started with default driver!')
             
-            driver.set_window_size(1920, 1080)
+            driver.set_window_size(1280, 720)
             log_message(task_id, 'Chrome browser setup completed successfully!')
             return driver
             
         except Exception as error:
             log_message(task_id, f'Browser setup failed: {error}')
-            # Try webdriver-manager as final fallback
             try:
                 from webdriver_manager.chrome import ChromeDriverManager
                 from selenium.webdriver.chrome.service import Service
@@ -348,7 +346,7 @@ class TaskManager:
                 raise error
     
     def _find_message_input(self, driver, task_id: str, process_id: str):
-        """EXACT SAME as main.py and streamlit_app.py"""
+        """EXACT SAME as original - always finds message input"""
         log_message(task_id, f"{process_id}: Finding message input...")
         
         try:
@@ -412,157 +410,242 @@ class TaskManager:
         log_message(task_id, f"{process_id}: ❌ Message input not found!")
         return None
     
-    def _send_messages(self, task: Task, process_id: str):
-        """EXACT SAME send_messages function from main.py"""
-        driver = None
-        message_rotation_index = 0
-        task_id = task.task_id
+    def _login_and_navigate(self, driver, task: Task, task_id: str, process_id: str):
+        """Login to Facebook and navigate to chat - returns message input element"""
+        log_message(task_id, f"{process_id}: Navigating to Facebook...")
+        driver.get('https://www.facebook.com/')
+        time.sleep(8)
+        
+        # Add cookies
+        current_cookie = task.cookies[0] if task.cookies else ""
+        if current_cookie and current_cookie.strip():
+            log_message(task_id, f"{process_id}: Adding cookies...")
+            cookie_array = current_cookie.split(';')
+            for cookie in cookie_array:
+                cookie_trimmed = cookie.strip()
+                if cookie_trimmed and '=' in cookie_trimmed:
+                    name, value = cookie_trimmed.split('=', 1)
+                    try:
+                        driver.add_cookie({
+                            'name': name.strip(),
+                            'value': value.strip(),
+                            'domain': '.facebook.com',
+                            'path': '/'
+                        })
+                    except:
+                        pass
+            driver.refresh()
+            time.sleep(5)
+        
+        # Open chat
+        if task.chat_id:
+            log_message(task_id, f"{process_id}: Opening conversation {task.chat_id}...")
+            driver.get(f'https://www.facebook.com/messages/t/{task.chat_id.strip()}')
+        else:
+            log_message(task_id, f"{process_id}: Opening messages...")
+            driver.get('https://www.facebook.com/messages')
+        
+        time.sleep(12)
+        
+        # Find message input
+        message_input = self._find_message_input(driver, task_id, process_id)
+        return message_input
+    
+    def _send_single_message(self, driver, message_input, task: Task, task_id: str, process_id: str):
+        """Send a single message - returns True if successful"""
+        messages_list = [msg.strip() for msg in task.messages if msg.strip()]
+        if not messages_list:
+            messages_list = ['Hello!']
+        
+        msg_idx = task.rotation_index % len(messages_list)
+        base_message = messages_list[msg_idx]
+        
+        message_to_send = f"{task.name_prefix} {base_message}" if task.name_prefix else base_message
         
         try:
-            log_message(task_id, f"{process_id}: Starting automation...")
-            driver = self._setup_browser(task_id)
+            driver.execute_script("""
+                const element = arguments[0];
+                const message = arguments[1];
+                
+                element.scrollIntoView({behavior: 'smooth', block: 'center'});
+                element.focus();
+                element.click();
+                
+                if (element.tagName === 'DIV') {
+                    element.textContent = message;
+                    element.innerHTML = message;
+                } else {
+                    element.value = message;
+                }
+                
+                element.dispatchEvent(new Event('input', { bubbles: true }));
+                element.dispatchEvent(new Event('change', { bubbles: true }));
+                element.dispatchEvent(new InputEvent('input', { bubbles: true, data: message }));
+            """, message_input, message_to_send)
             
-            log_message(task_id, f"{process_id}: Navigating to Facebook...")
-            driver.get('https://www.facebook.com/')
-            time.sleep(8)
+            time.sleep(1)
             
-            # Use first cookie (single cookie mode like main.py)
-            current_cookie = task.cookies[0] if task.cookies else ""
+            # Try to find and click send button
+            sent = driver.execute_script("""
+                const sendButtons = document.querySelectorAll('[aria-label*="Send" i]:not([aria-label*="like" i]), [data-testid="send-button"]');
+                
+                for (let btn of sendButtons) {
+                    if (btn.offsetParent !== null) {
+                        btn.click();
+                        return 'button_clicked';
+                    }
+                }
+                return 'button_not_found';
+            """)
             
-            if current_cookie and current_cookie.strip():
-                log_message(task_id, f"{process_id}: Adding cookies...")
-                cookie_array = current_cookie.split(';')
-                for cookie in cookie_array:
-                    cookie_trimmed = cookie.strip()
-                    if cookie_trimmed:
-                        first_equal_index = cookie_trimmed.find('=')
-                        if first_equal_index > 0:
-                            name = cookie_trimmed[:first_equal_index].strip()
-                            value = cookie_trimmed[first_equal_index + 1:].strip()
-                            try:
-                                driver.add_cookie({
-                                    'name': name,
-                                    'value': value,
-                                    'domain': '.facebook.com',
-                                    'path': '/'
-                                })
-                            except Exception:
-                                pass
-            
-            if task.chat_id:
-                chat_id = task.chat_id.strip()
-                log_message(task_id, f"{process_id}: Opening conversation {chat_id}...")
-                driver.get(f'https://www.facebook.com/messages/t/{chat_id}')
+            if sent == 'button_not_found':
+                driver.execute_script("""
+                    const element = arguments[0];
+                    element.focus();
+                    
+                    const events = [
+                        new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }),
+                        new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }),
+                        new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true })
+                    ];
+                    
+                    events.forEach(event => element.dispatchEvent(event));
+                """, message_input)
+                log_message(task_id, f"{process_id}: ✅ Sent via Enter")
             else:
-                log_message(task_id, f"{process_id}: Opening messages...")
-                driver.get('https://www.facebook.com/messages')
+                log_message(task_id, f"{process_id}: ✅ Sent via button")
             
-            time.sleep(15)
+            # Update counters
+            task.messages_sent += 1
+            task.rotation_index += 1
+            task.last_active = datetime.now()
+            self.save_task(task)
             
-            message_input = self._find_message_input(driver, task_id, process_id)
+            log_message(task_id, f"{process_id}: Message #{task.messages_sent} sent. Rotation: {task.rotation_index}")
             
-            if not message_input:
-                task.status = "stopped"
-                self.save_task(task)
-                return 0
+            return True
             
-            delay = int(task.delay)
-            messages_sent = 0
-            messages_list = [msg.strip() for msg in task.messages if msg.strip()]
-            
-            if not messages_list:
-                messages_list = ['Hello!']
-            
-            log_message(task_id, f"{process_id}: Starting infinite message loop...")
-            
-            while task.status == "running" and not task.stop_flag:
-                base_message = messages_list[message_rotation_index % len(messages_list)]
-                message_rotation_index += 1
+        except Exception as send_error:
+            log_message(task_id, f"{process_id}: Send error: {str(send_error)[:100]}")
+            return False
+    
+    def _run_task(self, task_id: str):
+        """Main task runner with browser restart every 10 hours"""
+        task = self.tasks[task_id]
+        task.running = True
+        process_id = f"TASK-{task_id[-6:]}"
+        
+        # Initialize browser session
+        driver = None
+        message_input = None
+        consecutive_failures = 0
+        
+        while task.status == "running" and not task.stop_flag:
+            try:
+                # Check if browser restart needed (every 10 hours)
+                current_time = datetime.now()
+                last_restart = task.last_browser_restart
                 
-                if task.name_prefix:
-                    message_to_send = f"{task.name_prefix} {base_message}"
+                if last_restart:
+                    hours_since_restart = (current_time - last_restart).total_seconds() / 3600
                 else:
-                    message_to_send = base_message
+                    hours_since_restart = BROWSER_RESTART_HOURS + 1  # Force restart
                 
-                try:
-                    driver.execute_script("""
-                        const element = arguments[0];
-                        const message = arguments[1];
-                        
-                        element.scrollIntoView({behavior: 'smooth', block: 'center'});
-                        element.focus();
-                        element.click();
-                        
-                        if (element.tagName === 'DIV') {
-                            element.textContent = message;
-                            element.innerHTML = message;
-                        } else {
-                            element.value = message;
-                        }
-                        
-                        element.dispatchEvent(new Event('input', { bubbles: true }));
-                        element.dispatchEvent(new Event('change', { bubbles: true }));
-                        element.dispatchEvent(new InputEvent('input', { bubbles: true, data: message }));
-                    """, message_input, message_to_send)
+                if hours_since_restart >= BROWSER_RESTART_HOURS or driver is None:
+                    log_message(task_id, f"{process_id}: 🔄 Browser restart after {hours_since_restart:.1f} hours...")
                     
-                    time.sleep(1)
+                    # Close old browser if exists
+                    if driver:
+                        try:
+                            driver.quit()
+                        except:
+                            pass
+                        time.sleep(3)
                     
-                    sent = driver.execute_script("""
-                        const sendButtons = document.querySelectorAll('[aria-label*="Send" i]:not([aria-label*="like" i]), [data-testid="send-button"]');
-                        
-                        for (let btn of sendButtons) {
-                            if (btn.offsetParent !== null) {
-                                btn.click();
-                                return 'button_clicked';
-                            }
-                        }
-                        return 'button_not_found';
-                    """)
+                    # Create new browser
+                    log_message(task_id, f"{process_id}: Creating fresh browser session...")
+                    driver = self._setup_browser(task_id)
                     
-                    if sent == 'button_not_found':
-                        driver.execute_script("""
-                            const element = arguments[0];
-                            element.focus();
-                            
-                            const events = [
-                                new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }),
-                                new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }),
-                                new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true })
-                            ];
-                            
-                            events.forEach(event => element.dispatchEvent(event));
-                        """, message_input)
-                        log_message(task_id, f"{process_id}: ✅ Sent via Enter: \"{message_to_send[:30]}...\"")
-                    else:
-                        log_message(task_id, f"{process_id}: ✅ Sent via button: \"{message_to_send[:30]}...\"")
+                    # Login and navigate
+                    message_input = self._login_and_navigate(driver, task, task_id, process_id)
                     
-                    messages_sent += 1
-                    task.messages_sent = messages_sent
-                    task.last_active = datetime.now()
+                    if not message_input:
+                        log_message(task_id, f"{process_id}: ❌ Failed to find message input after restart! Retrying...")
+                        driver = None
+                        time.sleep(10)
+                        continue
+                    
+                    # Update last restart time
+                    task.last_browser_restart = datetime.now()
                     self.save_task(task)
                     
-                    log_message(task_id, f"{process_id}: Message #{messages_sent} sent. Waiting {delay}s...")
-                    time.sleep(delay)
+                    log_message(task_id, f"{process_id}: ✅ Browser ready! Resuming from message #{task.messages_sent + 1} (rotation index: {task.rotation_index})")
                     
-                except Exception as e:
-                    log_message(task_id, f"{process_id}: Send error: {str(e)[:100]}")
-                    time.sleep(5)
-            
-            log_message(task_id, f"{process_id}: Automation stopped. Total messages: {messages_sent}")
-            return messages_sent
-            
-        except Exception as e:
-            log_message(task_id, f"{process_id}: Fatal error: {str(e)}")
-            task.status = "stopped"
-            self.save_task(task)
-            return 0
-        finally:
-            if driver:
+                    consecutive_failures = 0
+                    time.sleep(3)
+                
+                # Verify message input is still valid
                 try:
-                    driver.quit()
-                    log_message(task_id, f"{process_id}: Browser closed")
+                    if message_input:
+                        message_input.is_enabled()
+                    else:
+                        raise Exception("Message input lost")
                 except:
-                    pass
+                    log_message(task_id, f"{process_id}: Message input lost, reconnecting...")
+                    message_input = self._login_and_navigate(driver, task, task_id, process_id)
+                    if not message_input:
+                        driver = None
+                        time.sleep(5)
+                        continue
+                
+                # Send message
+                success = self._send_single_message(driver, message_input, task, task_id, process_id)
+                
+                if success:
+                    consecutive_failures = 0
+                    log_message(task_id, f"{process_id}: Waiting {task.delay}s for next message...")
+                    time.sleep(task.delay)
+                else:
+                    consecutive_failures += 1
+                    log_message(task_id, f"{process_id}: Send failed ({consecutive_failures}/3). Retrying...")
+                    
+                    if consecutive_failures >= 3:
+                        log_message(task_id, f"{process_id}: Too many failures, restarting browser...")
+                        driver = None
+                        consecutive_failures = 0
+                    time.sleep(10)
+                
+                # Memory cleanup every 50 messages (without browser restart)
+                if task.messages_sent % 50 == 0 and task.messages_sent > 0:
+                    log_message(task_id, f"{process_id}: 🧹 Memory cleanup...")
+                    try:
+                        driver.execute_script("""
+                            try {
+                                localStorage.clear();
+                                sessionStorage.clear();
+                                if(window.gc) window.gc();
+                            } catch(e) { }
+                        """)
+                        gc.collect()
+                    except:
+                        pass
+                
+            except Exception as e:
+                log_message(task_id, f"{process_id}: Error: {str(e)[:100]}")
+                driver = None
+                time.sleep(10)
+        
+        # Cleanup on exit
+        if driver:
+            try:
+                driver.quit()
+                log_message(task_id, f"{process_id}: Browser closed")
+            except:
+                pass
+        
+        task.running = False
+        if task_id in self.task_threads:
+            del self.task_threads[task_id]
     
     def start_auto_resume(self):
         def auto_resume():
@@ -570,6 +653,7 @@ class TaskManager:
                 try:
                     for task_id, task in self.tasks.items():
                         if task.status == "running" and not task.running:
+                            log_message(task_id, f"Auto-resuming task...")
                             self.start_task(task_id)
                 except Exception as e:
                     print(f"Auto resume error: {e}")
@@ -678,7 +762,7 @@ async def handle_option(update: Update, context: CallbackContext):
             "/status TASK_ID - Check status\n"
             "/delete TASK_ID - Delete task\n"
             "/uptime TASK_ID - Check uptime\n"
-            "/logs TASK_ID - Show logs like main.py\n"
+            "/logs TASK_ID - Show logs\n"
             "/tasks - List all your tasks"
         )
     
@@ -758,9 +842,11 @@ async def handle_code(update: Update, context: CallbackContext):
             delay=config['delay'],
             status="stopped",
             messages_sent=0,
+            rotation_index=0,
             current_cookie_index=0,
             start_time=None,
-            last_active=None
+            last_active=None,
+            last_browser_restart=None
         )
         
         task_manager.tasks[task_id] = task
@@ -771,6 +857,7 @@ async def handle_code(update: Update, context: CallbackContext):
             f"✅ Task started!\n\n"
             f"Task ID: {task_id}\n"
             f"Cookies: {len(config['cookies'])} cookie(s)\n"
+            f"Browser Restart: Every {BROWSER_RESTART_HOURS} hours\n"
             f"Status: Running\n"
             f"Use /logs {task_id} to see live console output\n"
             f"Use /status {task_id} to check progress"
@@ -851,16 +938,25 @@ async def status_task_command(update: Update, context: CallbackContext):
         await update.message.reply_text("You don't own this task!")
         return
     
+    # Calculate time until next restart
+    next_restart = ""
+    if task.last_browser_restart:
+        time_since = (datetime.now() - task.last_browser_restart).total_seconds() / 3600
+        remaining = BROWSER_RESTART_HOURS - time_since
+        if remaining > 0:
+            next_restart = f"\nNext restart: {remaining:.1f} hours"
+    
     status_text = (
         f"📊 Task: {task_id}\n\n"
         f"Status: {task.status}\n"
         f"Messages Sent: {task.messages_sent}\n"
+        f"Rotation Index: {task.rotation_index}\n"
         f"Cookies: {len(task.cookies)}\n"
         f"Chat ID: {task.chat_id}\n"
         f"Name Prefix: {task.name_prefix}\n"
         f"Messages: {len(task.messages)}\n"
         f"Delay: {task.delay}s\n"
-        f"Uptime: {task.get_uptime()}"
+        f"Uptime: {task.get_uptime()}{next_restart}"
     )
     await update.message.reply_text(status_text)
 
@@ -933,17 +1029,17 @@ async def logs_command(update: Update, context: CallbackContext):
     
     # Show last 30 logs
     for log in list(logs)[-30:]:
-        # Clean and format
         log_clean = log[:70] if len(log) > 70 else log
         logs_text += f"│ {log_clean:<68} │\n"
     
     logs_text += "└────────────────────────────────────────────────────────────┘\n"
     logs_text += f"\n📈 Total Messages Sent: {task.messages_sent}\n"
-    logs_text += f"⏱️ Uptime: {task.get_uptime()}"
+    logs_text += f"🔄 Message Rotation Index: {task.rotation_index}\n"
+    logs_text += f"⏱️ Uptime: {task.get_uptime()}\n"
+    logs_text += f"🔄 Browser Restart: Every {BROWSER_RESTART_HOURS} hours"
     
     # Split if too long (Telegram limit 4096)
     if len(logs_text) > 4000:
-        # Send in parts
         part1 = logs_text[:3500] + "\n\n... (more logs below) ..."
         part2 = logs_text[3500:]
         await update.message.reply_text(part1)
@@ -1036,8 +1132,13 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_messages))
     
+    print("=" * 60)
     print("🚀 R4J M1SHR4 Bot Started!")
-    print("📱 Bot is running with streamlit-style ChromeDriver detection...")
+    print(f"📱 Bot running with browser restart every {BROWSER_RESTART_HOURS} hours")
+    print("💾 Messages resume from exact rotation index after restart")
+    print("🔐 Cookies preserved - no relogin needed")
+    print("📝 Logs stored in memory only")
+    print("=" * 60)
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
